@@ -19,12 +19,15 @@ import {
   recordExamSubmission,
   recordStudyAnswer,
   toggleBookmark,
+  toggleThemeMode,
   useLearningProgress,
+  useTheme,
 } from "../lib/storage";
 import type { ExamHistoryItem, Question } from "../types";
 
 type Mode = "study" | "exam" | "stats";
 type StudyFilter = "all" | "unanswered" | "wrong" | "bookmarked";
+type StudyStyle = "quiz" | "memorize";
 type ExamStatus = "idle" | "active" | "done";
 type ExamReviewFilter = "all" | "mistakes";
 
@@ -61,15 +64,21 @@ function formatDateTime(iso: string): string {
 
 export default function QuizApp({ questions }: { questions: Question[] }) {
   const progress = useLearningProgress();
+  const theme = useTheme();
 
   const [mode, setMode] = useState<Mode>("study");
 
   // Trạng thái chế độ Ôn tập
   const [chapter, setChapter] = useState("Tất cả");
   const [studyFilter, setStudyFilter] = useState<StudyFilter>("all");
+  const [studyStyle, setStudyStyle] = useState<StudyStyle>("quiz");
+  const [autoAdvance, setAutoAdvance] = useState(false);
   const [query, setQuery] = useState("");
   const [studyIndex, setStudyIndex] = useState(0);
   const [peekedIds, setPeekedIds] = useState<Record<number, true>>({});
+
+  // Drawer di động (dùng chung cho Ôn tập & Thi thử)
+  const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
 
   // Trạng thái chế độ Thi thử
   const [examStatus, setExamStatus] = useState<ExamStatus>("idle");
@@ -85,8 +94,19 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
   const [confirmExitExam, setConfirmExitExam] = useState(false);
   const [reviewFilter, setReviewFilter] = useState<ExamReviewFilter>("all");
 
-  // Xác nhận 2 bước khi đặt lại dữ liệu ở tab Thống kê
+  // Xác nhận 2 bước khi đặt lại dữ liệu
   const [confirmReset, setConfirmReset] = useState<"none" | "study" | "all">("none");
+
+  const autoAdvanceTimerRef = useRef<number | null>(null);
+
+  const clearAutoAdvanceTimer = useCallback(() => {
+    if (autoAdvanceTimerRef.current !== null) {
+      window.clearTimeout(autoAdvanceTimerRef.current);
+      autoAdvanceTimerRef.current = null;
+    }
+  }, []);
+
+  useEffect(() => clearAutoAdvanceTimer, [clearAutoAdvanceTimer]);
 
   const fixedExams = useMemo(
     () => buildFixedExams(questions, FIXED_EXAM_COUNT),
@@ -195,7 +215,6 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     });
   }, [chapterCounts, progress.studyAnswers, questions, wrongSet]);
 
-  // Kết quả tốt nhất của từng đề trong bộ 20 đề chuẩn
   const bestByExamSet = useMemo(() => {
     const map = new Map<number, ExamHistoryItem>();
     for (const item of progress.examHistory) {
@@ -212,7 +231,6 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     return map;
   }, [progress.examHistory]);
 
-  // Danh sách câu hiển thị trong chế độ xem lại bài thi
   const visibleExamEntries = useMemo(() => {
     return examQuestions
       .map((question, originalIndex) => ({ question, originalIndex }))
@@ -227,6 +245,22 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
       ? Math.min(examIndex, visibleExamEntries.length - 1)
       : 0;
   const currentExamEntry = visibleExamEntries[safeExamEntryIndex];
+
+  const handleSelectStudyOption = useCallback(
+    (question: Question, optionId: number) => {
+      clearAutoAdvanceTimer();
+      const isCorrect = optionId === question.answer;
+      recordStudyAnswer(question.id, optionId, isCorrect);
+
+      if (autoAdvance && isCorrect && safeStudyIndex < filteredQuestions.length - 1) {
+        autoAdvanceTimerRef.current = window.setTimeout(() => {
+          setStudyIndex((v) => Math.min(filteredQuestions.length - 1, v + 1));
+          autoAdvanceTimerRef.current = null;
+        }, 550);
+      }
+    },
+    [autoAdvance, clearAutoAdvanceTimer, filteredQuestions.length, safeStudyIndex],
+  );
 
   const submitExam = useCallback(() => {
     if (examQuestions.length === 0) return;
@@ -283,6 +317,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     });
     setConfirmSubmitOpen(false);
     setConfirmExitExam(false);
+    setMobileSheetOpen(false);
     setReviewFilter("all");
     setExamIndex(0);
     setExamStatus("done");
@@ -328,8 +363,20 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     return () => window.clearInterval(timer);
   }, [examStatus]);
 
+  // Khóa cuộn trang nền khi mở drawer hoặc modal
+  const hasOverlayOpen = mobileSheetOpen || confirmSubmitOpen || showResultModal;
+  useEffect(() => {
+    if (!hasOverlayOpen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [hasOverlayOpen]);
+
   const startExamWith = useCallback(
     (picked: Question[], label: string, setId: number | null) => {
+      clearAutoAdvanceTimer();
       setExamQuestions(picked);
       setExamLabel(label);
       setExamSetId(setId);
@@ -340,11 +387,12 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
       setShowResultModal(false);
       setConfirmSubmitOpen(false);
       setConfirmExitExam(false);
+      setMobileSheetOpen(false);
       setReviewFilter("all");
       setExamStatus("active");
       setMode("exam");
     },
-    [],
+    [clearAutoAdvanceTimer],
   );
 
   const startRandomExam = useCallback(() => {
@@ -360,15 +408,38 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     [fixedExams, startExamWith],
   );
 
-  const jumpToStudy = useCallback((nextChapter: string, nextFilter: StudyFilter) => {
-    setChapter(nextChapter);
-    setStudyFilter(nextFilter);
-    setQuery("");
-    setStudyIndex(0);
-    setMode("study");
+  const jumpToStudy = useCallback(
+    (nextChapter: string, nextFilter: StudyFilter) => {
+      clearAutoAdvanceTimer();
+      setChapter(nextChapter);
+      setStudyFilter(nextFilter);
+      setQuery("");
+      setStudyIndex(0);
+      setMobileSheetOpen(false);
+      setMode("study");
+    },
+    [clearAutoAdvanceTimer],
+  );
+
+  const goStudyPrev = useCallback(() => {
+    clearAutoAdvanceTimer();
+    setStudyIndex((v) => Math.max(0, v - 1));
+  }, [clearAutoAdvanceTimer]);
+
+  const goStudyNext = useCallback(() => {
+    clearAutoAdvanceTimer();
+    setStudyIndex((v) => Math.min(filteredQuestions.length - 1, v + 1));
+  }, [clearAutoAdvanceTimer, filteredQuestions.length]);
+
+  const goExamPrev = useCallback(() => {
+    setExamIndex((v) => Math.max(0, v - 1));
   }, []);
 
-  // Phím tắt tiện dụng cho người dùng máy tính
+  const goExamNext = useCallback(() => {
+    setExamIndex((v) => Math.min(visibleExamEntries.length - 1, v + 1));
+  }, [visibleExamEntries.length]);
+
+  // Phím tắt tiện dụng cho người dùng laptop
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.metaKey || event.ctrlKey || event.altKey) return;
@@ -393,38 +464,46 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
           setShowResultModal(false);
           return;
         }
+        if (mobileSheetOpen) {
+          setMobileSheetOpen(false);
+          return;
+        }
       }
 
-      if (confirmSubmitOpen || showResultModal) return;
+      if (confirmSubmitOpen || showResultModal || mobileSheetOpen) return;
 
       if (mode === "study" && currentStudyQuestion) {
         if (event.key === "ArrowLeft") {
           event.preventDefault();
-          setStudyIndex((v) => Math.max(0, v - 1));
+          goStudyPrev();
         } else if (event.key === "ArrowRight") {
           event.preventDefault();
-          setStudyIndex((v) => Math.min(filteredQuestions.length - 1, v + 1));
+          goStudyNext();
         } else if (event.key === "b" || event.key === "B") {
           event.preventDefault();
           toggleBookmark(currentStudyQuestion.id);
+        } else if (event.key === " ") {
+          if (
+            studyStyle === "quiz" &&
+            progress.studyAnswers[currentStudyQuestion.id] === undefined
+          ) {
+            event.preventDefault();
+            setPeekedIds((prev) => ({ ...prev, [currentStudyQuestion.id]: true }));
+          }
         } else if (["1", "2", "3", "4"].includes(event.key)) {
           const optId = Number(event.key);
           if (currentStudyQuestion.options.some((o) => o.id === optId)) {
             event.preventDefault();
-            recordStudyAnswer(
-              currentStudyQuestion.id,
-              optId,
-              optId === currentStudyQuestion.answer,
-            );
+            handleSelectStudyOption(currentStudyQuestion, optId);
           }
         }
       } else if (mode === "exam" && examStatus !== "idle" && currentExamEntry) {
         if (event.key === "ArrowLeft") {
           event.preventDefault();
-          setExamIndex((v) => Math.max(0, v - 1));
+          goExamPrev();
         } else if (event.key === "ArrowRight") {
           event.preventDefault();
-          setExamIndex((v) => Math.min(visibleExamEntries.length - 1, v + 1));
+          goExamNext();
         } else if (event.key === "b" || event.key === "B") {
           event.preventDefault();
           toggleBookmark(currentExamEntry.question.id);
@@ -446,20 +525,31 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     currentExamEntry,
     currentStudyQuestion,
     examStatus,
-    filteredQuestions.length,
+    goExamNext,
+    goExamPrev,
+    goStudyNext,
+    goStudyPrev,
+    handleSelectStudyOption,
+    mobileSheetOpen,
     mode,
+    progress.studyAnswers,
     showResultModal,
-    visibleExamEntries.length,
+    studyStyle,
   ]);
 
   const answeredExamCount = Object.keys(examAnswers).length;
   const remainingExamUnanswered = Math.max(0, examQuestions.length - answeredExamCount);
   const timerState =
     timeLeft <= 60 ? "urgent" : timeLeft <= 180 ? "warning" : "normal";
-
   const passedExamsCount = progress.examHistory.filter((item) => item.passed).length;
 
+  const activeStudyFilterCount =
+    (chapter !== "Tất cả" ? 1 : 0) +
+    (studyFilter !== "all" ? 1 : 0) +
+    (query.trim() ? 1 : 0);
+
   const handleRequestSubmit = () => {
+    setMobileSheetOpen(false);
     if (remainingExamUnanswered > 0) {
       setConfirmSubmitOpen(true);
     } else {
@@ -467,54 +557,488 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
     }
   };
 
-  return (
-    <div className="app-shell">
-      <header className="topbar">
-        <div className="brand-group">
-          <div className="brand-mark" aria-hidden="true">
-            <svg width="26" height="26" viewBox="0 0 64 64" fill="none">
-              <circle cx="32" cy="32" r="20" stroke="currentColor" strokeWidth="5.5" />
-              <circle cx="32" cy="32" r="5" fill="currentColor" />
-              <path
-                d="M14 29H50"
-                stroke="currentColor"
-                strokeWidth="5"
-                strokeLinecap="round"
-              />
-              <path
-                d="M32 35V51"
-                stroke="currentColor"
-                strokeWidth="5"
-                strokeLinecap="round"
-              />
-            </svg>
-          </div>
-          <div>
-            <p className="eyebrow">Bộ 600 câu hỏi sát hạch lái xe</p>
-            <h1>Học Lái Xe</h1>
-          </div>
+  const hasMobileBottomBar =
+    mode === "study" || (mode === "exam" && examStatus !== "idle");
+
+  // Khối nội dung bảng điều khiển Ôn tập (dùng chung cho Sidebar laptop & Drawer điện thoại)
+  const studySidebarContent = (
+    <>
+      <div className="sidebar-progress">
+        <div className="progress-row">
+          <span>Tiến độ ôn tập</span>
+          <strong>
+            {studySummary.answered} / {questions.length} câu
+          </strong>
+        </div>
+        <div
+          className="progress-track"
+          role="progressbar"
+          aria-valuenow={studySummary.answered}
+          aria-valuemin={0}
+          aria-valuemax={questions.length}
+        >
+          <div
+            className="progress-fill"
+            style={{
+              width: `${Math.round((studySummary.answered / questions.length) * 100)}%`,
+            }}
+          />
+        </div>
+        <div className="mini-metrics">
+          <span className="metric-ok">Đúng: {studySummary.correct}</span>
+          <span className="metric-bad">Làm sai: {progress.wrongIds.length}</span>
+          <span className="metric-mark">Đã lưu: {progress.bookmarks.length}</span>
+        </div>
+      </div>
+
+      <div className="study-style-box">
+        <div className="segmented-mini" role="group" aria-label="Cách học">
+          <button
+            type="button"
+            className={studyStyle === "quiz" ? "active" : ""}
+            onClick={() => setStudyStyle("quiz")}
+          >
+            Tự kiểm tra
+          </button>
+          <button
+            type="button"
+            className={studyStyle === "memorize" ? "active" : ""}
+            onClick={() => setStudyStyle("memorize")}
+          >
+            Hiện sẵn đáp án
+          </button>
         </div>
 
-        <nav className="mode-switch" aria-label="Điều hướng chính">
+        {studyStyle === "quiz" ? (
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={autoAdvance}
+              onChange={(event) => setAutoAdvance(event.target.checked)}
+            />
+            <span>Tự chuyển câu tiếp khi chọn đúng</span>
+          </label>
+        ) : null}
+      </div>
+
+      <label className="field-stack">
+        <span className="field-label">Chương học</span>
+        <select
+          value={chapter}
+          onChange={(event) => {
+            clearAutoAdvanceTimer();
+            setChapter(event.target.value);
+            setStudyIndex(0);
+          }}
+        >
+          {chapters.map((item) => {
+            const count =
+              item === "Tất cả" ? questions.length : (chapterCounts.get(item) ?? 0);
+            return (
+              <option key={item} value={item}>
+                {item} ({count})
+              </option>
+            );
+          })}
+        </select>
+      </label>
+
+      <div className="filter-chips" role="group" aria-label="Lọc câu hỏi theo trạng thái">
+        {(
+          [
+            { id: "all", label: "Tất cả" },
+            { id: "unanswered", label: "Chưa làm" },
+            { id: "wrong", label: `Làm sai (${progress.wrongIds.length})` },
+            { id: "bookmarked", label: `Đã lưu (${progress.bookmarks.length})` },
+          ] as const
+        ).map((chip) => (
+          <button
+            key={chip.id}
+            type="button"
+            className={`chip-btn${studyFilter === chip.id ? " active" : ""}`}
+            onClick={() => {
+              clearAutoAdvanceTimer();
+              setStudyFilter(chip.id);
+              setStudyIndex(0);
+            }}
+          >
+            {chip.label}
+          </button>
+        ))}
+      </div>
+
+      <label className="field-stack">
+        <span className="field-label">Tìm câu hỏi</span>
+        <div className="search-box">
+          <input
+            value={query}
+            onChange={(event) => {
+              clearAutoAdvanceTimer();
+              setQuery(event.target.value);
+              setStudyIndex(0);
+            }}
+            placeholder="Nhập số câu (VD: 120) hoặc từ khóa..."
+          />
+          {query ? (
+            <button
+              type="button"
+              className="search-clear"
+              onClick={() => {
+                setQuery("");
+                setStudyIndex(0);
+              }}
+              aria-label="Xóa từ khóa"
+            >
+              ✕
+            </button>
+          ) : null}
+        </div>
+      </label>
+
+      <div className="grid-header">
+        <span>Chọn nhanh câu hỏi</span>
+        <span>{filteredQuestions.length} câu</span>
+      </div>
+
+      <div className="legend-row" aria-hidden="true">
+        <span>
+          <i className="dot dot-current" /> Đang xem
+        </span>
+        <span>
+          <i className="dot dot-ok" /> Đúng
+        </span>
+        <span>
+          <i className="dot dot-bad" /> Sai
+        </span>
+        <span>
+          <i className="dot dot-mark" /> Đã lưu
+        </span>
+      </div>
+
+      <div className="question-grid" aria-label="Danh sách câu hỏi">
+        {filteredQuestions.map((question, index) => {
+          const answered = progress.studyAnswers[question.id];
+          const isCorrect = answered !== undefined && answered === question.answer;
+          const isWrong = answered !== undefined && answered !== question.answer;
+          const isBookmarked = bookmarkSet.has(question.id);
+
+          return (
+            <button
+              key={question.id}
+              type="button"
+              className={[
+                index === safeStudyIndex ? "current" : "",
+                isCorrect ? "tile-correct" : "",
+                isWrong ? "tile-wrong" : "",
+                isBookmarked ? "tile-bookmarked" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              onClick={() => {
+                clearAutoAdvanceTimer();
+                setStudyIndex(index);
+                setMobileSheetOpen(false);
+              }}
+            >
+              {question.id}
+            </button>
+          );
+        })}
+      </div>
+    </>
+  );
+
+  // Khối nội dung điều khiển Thi thử (Sidebar laptop & Drawer điện thoại)
+  const examSidebarContent = (
+    <>
+      <div className="exam-header-box">
+        <span className="pill pill-primary">{examLabel}</span>
+        {examStatus === "active" ? (
+          confirmExitExam ? (
+            <div className="inline-confirm">
+              <button
+                type="button"
+                className="danger-link"
+                onClick={() => {
+                  setExamStatus("idle");
+                  setConfirmExitExam(false);
+                  setMobileSheetOpen(false);
+                }}
+              >
+                Xác nhận thoát
+              </button>
+              <button
+                type="button"
+                className="muted-link"
+                onClick={() => setConfirmExitExam(false)}
+              >
+                Hủy
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              className="muted-link"
+              onClick={() => setConfirmExitExam(true)}
+            >
+              Thoát đề
+            </button>
+          )
+        ) : (
+          <button
+            type="button"
+            className="muted-link"
+            onClick={() => {
+              setExamStatus("idle");
+              setMobileSheetOpen(false);
+            }}
+          >
+            Chọn đề khác
+          </button>
+        )}
+      </div>
+
+      <div className={`timer-card ${examStatus === "active" ? timerState : "done"}`}>
+        <span>{examStatus === "active" ? "Thời gian còn lại" : "Thời gian hoàn thành"}</span>
+        <strong>
+          {examStatus === "active"
+            ? formatTime(timeLeft)
+            : formatTime(examResult?.durationSeconds ?? 0)}
+        </strong>
+        <p>
+          Đã chọn {answeredExamCount} / {examQuestions.length} câu
+        </p>
+      </div>
+
+      {examStatus === "done" && examResult ? (
+        <div className={`result-summary-card ${examResult.passed ? "passed" : "failed"}`}>
+          <div className="result-summary-head">
+            <span>{examResult.passed ? "Đạt yêu cầu" : "Chưa đạt yêu cầu"}</span>
+            <strong>
+              {examResult.correct}/{examResult.total}
+            </strong>
+          </div>
+          <p>
+            Đúng {examResult.correct} · Sai {examResult.wrong} · Bỏ trống {examResult.unanswered} (
+            {Math.round((examResult.correct / examResult.total) * 100)}%)
+          </p>
+          <div className="result-summary-actions">
+            <button
+              type="button"
+              className="ghost-btn small"
+              onClick={() => {
+                setMobileSheetOpen(false);
+                setShowResultModal(true);
+              }}
+            >
+              Chi tiết kết quả
+            </button>
+            <button type="button" className="primary-btn small" onClick={startRandomExam}>
+              Đề mới
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      {examStatus === "done" ? (
+        <div className="filter-chips" role="group" aria-label="Lọc câu xem lại">
+          <button
+            type="button"
+            className={`chip-btn${reviewFilter === "all" ? " active" : ""}`}
+            onClick={() => {
+              setReviewFilter("all");
+              setExamIndex(0);
+            }}
+          >
+            Tất cả ({examQuestions.length})
+          </button>
+          <button
+            type="button"
+            className={`chip-btn${reviewFilter === "mistakes" ? " active" : ""}`}
+            onClick={() => {
+              setReviewFilter("mistakes");
+              setExamIndex(0);
+            }}
+          >
+            Câu sai & bỏ trống ({(examResult?.wrong ?? 0) + (examResult?.unanswered ?? 0)})
+          </button>
+        </div>
+      ) : null}
+
+      <div className="question-grid exam-grid" aria-label="Danh sách câu trong đề">
+        {visibleExamEntries.map(({ question, originalIndex }, idx) => {
+          const selected = examAnswers[question.id];
+          const isCorrect = examStatus === "done" && selected === question.answer;
+          const isWrong = examStatus === "done" && selected !== question.answer;
+
+          return (
+            <button
+              key={question.id}
+              type="button"
+              className={[
+                idx === safeExamEntryIndex ? "current" : "",
+                examStatus === "active" && selected !== undefined ? "tile-answered" : "",
+                isCorrect ? "tile-correct" : "",
+                isWrong ? "tile-wrong" : "",
+                bookmarkSet.has(question.id) ? "tile-bookmarked" : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+              onClick={() => {
+                setExamIndex(idx);
+                setMobileSheetOpen(false);
+              }}
+            >
+              {originalIndex + 1}
+            </button>
+          );
+        })}
+      </div>
+
+      {examStatus === "active" ? (
+        <button type="button" className="primary-btn full-width" onClick={handleRequestSubmit}>
+          Nộp bài ({answeredExamCount}/{examQuestions.length})
+        </button>
+      ) : null}
+    </>
+  );
+
+  return (
+    <div className={`app-shell${hasMobileBottomBar ? " has-mobile-bar" : ""}`}>
+      <header className="topbar">
+        <div className="topbar-row">
+          <div className="brand-group">
+            <div className="brand-mark" aria-hidden="true">
+              <svg width="24" height="24" viewBox="0 0 64 64" fill="none">
+                <circle cx="32" cy="32" r="20" stroke="currentColor" strokeWidth="5.5" />
+                <circle cx="32" cy="32" r="5" fill="currentColor" />
+                <path
+                  d="M14 29H50"
+                  stroke="currentColor"
+                  strokeWidth="5"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M32 35V51"
+                  stroke="currentColor"
+                  strokeWidth="5"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </div>
+            <div>
+              <h1>Học Lái Xe</h1>
+              <p className="eyebrow">600 câu lý thuyết sát hạch</p>
+            </div>
+          </div>
+
+          <nav className="mode-switch desktop-nav" aria-label="Điều hướng chính">
+            <button
+              type="button"
+              className={mode === "study" ? "active" : ""}
+              onClick={() => {
+                setMobileSheetOpen(false);
+                setMode("study");
+              }}
+            >
+              Ôn tập
+            </button>
+            <button
+              type="button"
+              className={mode === "exam" ? "active" : ""}
+              onClick={() => {
+                setMobileSheetOpen(false);
+                setMode("exam");
+              }}
+            >
+              Thi thử
+              {examStatus === "active" ? (
+                <span className="live-dot" aria-label="Đang làm bài" />
+              ) : null}
+            </button>
+            <button
+              type="button"
+              className={mode === "stats" ? "active" : ""}
+              onClick={() => {
+                setMobileSheetOpen(false);
+                setConfirmReset("none");
+                setMode("stats");
+              }}
+            >
+              Thống kê
+            </button>
+          </nav>
+
+          <button
+            type="button"
+            className="theme-btn"
+            onClick={toggleThemeMode}
+            aria-label={theme === "dark" ? "Chuyển sang giao diện sáng" : "Chuyển sang giao diện tối"}
+            title={theme === "dark" ? "Giao diện sáng" : "Giao diện tối"}
+          >
+            {theme === "dark" ? (
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <circle cx="12" cy="12" r="4" />
+                <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41" />
+              </svg>
+            ) : (
+              <svg
+                width="18"
+                height="18"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z" />
+              </svg>
+            )}
+            <span className="theme-label">{theme === "dark" ? "Sáng" : "Tối"}</span>
+          </button>
+        </div>
+
+        <nav className="mode-switch mobile-nav" aria-label="Điều hướng di động">
           <button
             type="button"
             className={mode === "study" ? "active" : ""}
-            onClick={() => setMode("study")}
+            onClick={() => {
+              setMobileSheetOpen(false);
+              setMode("study");
+            }}
           >
             Ôn tập
           </button>
           <button
             type="button"
             className={mode === "exam" ? "active" : ""}
-            onClick={() => setMode("exam")}
+            onClick={() => {
+              setMobileSheetOpen(false);
+              setMode("exam");
+            }}
           >
             Thi thử
-            {examStatus === "active" ? <span className="live-dot" aria-label="Đang làm bài" /> : null}
+            {examStatus === "active" ? (
+              <span className="live-dot" aria-label="Đang làm bài" />
+            ) : null}
           </button>
           <button
             type="button"
             className={mode === "stats" ? "active" : ""}
             onClick={() => {
+              setMobileSheetOpen(false);
               setConfirmReset("none");
               setMode("stats");
             }}
@@ -525,218 +1049,182 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
       </header>
 
       {mode === "study" ? (
-        <main className="workspace">
-          <aside className="sidebar">
-            <div className="sidebar-progress">
-              <div className="progress-row">
-                <span>Tiến độ ôn tập</span>
-                <strong>
-                  {studySummary.answered} / {questions.length} câu
-                </strong>
-              </div>
-              <div
-                className="progress-track"
-                role="progressbar"
-                aria-valuenow={studySummary.answered}
-                aria-valuemin={0}
-                aria-valuemax={questions.length}
+        <>
+          {/* Thanh điều khiển gọn trên điện thoại / máy tính bảng */}
+          <div className="mobile-toolbar">
+            <button
+              type="button"
+              className={`toolbar-pill${activeStudyFilterCount > 0 ? " active" : ""}`}
+              onClick={() => setMobileSheetOpen(true)}
+            >
+              <svg
+                width="15"
+                height="15"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
               >
-                <div
-                  className="progress-fill"
-                  style={{
-                    width: `${Math.round((studySummary.answered / questions.length) * 100)}%`,
-                  }}
-                />
-              </div>
-              <div className="mini-metrics">
-                <span className="metric-ok">Đúng: {studySummary.correct}</span>
-                <span className="metric-bad">Cần ôn: {progress.wrongIds.length}</span>
-                <span className="metric-mark">Đánh dấu: {progress.bookmarks.length}</span>
-              </div>
-            </div>
+                <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
+              </svg>
+              <span>
+                {chapter === "Tất cả" ? "Lọc & tìm" : CHAPTER_SHORT_LABELS[chapter] ?? chapter}
+              </span>
+              {activeStudyFilterCount > 0 ? (
+                <span className="badge-count">{activeStudyFilterCount}</span>
+              ) : null}
+            </button>
 
-            <div className="field-stack">
-              <label htmlFor="chapter-select">Chương học</label>
-              <select
-                id="chapter-select"
-                value={chapter}
-                onChange={(event) => {
-                  setChapter(event.target.value);
-                  setStudyIndex(0);
-                }}
-              >
-                {chapters.map((item) => {
-                  const count =
-                    item === "Tất cả" ? questions.length : (chapterCounts.get(item) ?? 0);
-                  return (
-                    <option key={item} value={item}>
-                      {item} ({count})
-                    </option>
-                  );
-                })}
-              </select>
-            </div>
+            <button
+              type="button"
+              className={`toolbar-pill${studyStyle === "memorize" ? " active" : ""}`}
+              onClick={() =>
+                setStudyStyle((prev) => (prev === "quiz" ? "memorize" : "quiz"))
+              }
+            >
+              {studyStyle === "memorize" ? "✓ Hiện sẵn đáp án" : "Hiện sẵn đáp án"}
+            </button>
 
-            <div className="filter-chips" role="group" aria-label="Lọc câu hỏi theo trạng thái">
-              {(
-                [
-                  { id: "all", label: "Tất cả" },
-                  { id: "unanswered", label: "Chưa làm" },
-                  { id: "wrong", label: `Làm sai (${progress.wrongIds.length})` },
-                  { id: "bookmarked", label: `Đánh dấu (${progress.bookmarks.length})` },
-                ] as const
-              ).map((chip) => (
-                <button
-                  key={chip.id}
-                  type="button"
-                  className={`chip-btn${studyFilter === chip.id ? " active" : ""}`}
-                  onClick={() => {
-                    setStudyFilter(chip.id);
-                    setStudyIndex(0);
-                  }}
-                >
-                  {chip.label}
-                </button>
-              ))}
-            </div>
+            <span className="toolbar-progress">
+              {studySummary.answered}/{questions.length}
+            </span>
+          </div>
 
-            <div className="field-stack">
-              <label htmlFor="question-search">Tìm câu hỏi</label>
-              <div className="search-box">
-                <input
-                  id="question-search"
-                  value={query}
-                  onChange={(event) => {
-                    setQuery(event.target.value);
-                    setStudyIndex(0);
-                  }}
-                  placeholder="Nhập số câu hoặc từ khóa..."
-                />
-                {query ? (
+          <main className="workspace">
+            <aside className="sidebar desktop-sidebar">{studySidebarContent}</aside>
+
+            <section className="main-column">
+              {currentStudyQuestion ? (
+                <>
+                  <QuestionCard
+                    question={currentStudyQuestion}
+                    selected={progress.studyAnswers[currentStudyQuestion.id]}
+                    reveal={
+                      studyStyle === "memorize" ||
+                      progress.studyAnswers[currentStudyQuestion.id] !== undefined ||
+                      Boolean(peekedIds[currentStudyQuestion.id])
+                    }
+                    studyShowAllMode={studyStyle === "memorize"}
+                    isBookmarked={bookmarkSet.has(currentStudyQuestion.id)}
+                    canPeekAnswer={
+                      studyStyle === "quiz" &&
+                      progress.studyAnswers[currentStudyQuestion.id] === undefined
+                    }
+                    onPeekAnswer={() =>
+                      setPeekedIds((prev) => ({
+                        ...prev,
+                        [currentStudyQuestion.id]: true,
+                      }))
+                    }
+                    onToggleBookmark={() => toggleBookmark(currentStudyQuestion.id)}
+                    onSelect={(optionId) =>
+                      handleSelectStudyOption(currentStudyQuestion, optionId)
+                    }
+                    onSwipePrev={goStudyPrev}
+                    onSwipeNext={goStudyNext}
+                  />
+
+                  <div className="pager-bar desktop-pager">
+                    <p className="shortcut-hint">
+                      Phím tắt: <kbd>←</kbd> <kbd>→</kbd> chuyển câu · <kbd>1</kbd>–<kbd>4</kbd>{" "}
+                      chọn · <kbd>Space</kbd> xem đáp án · <kbd>B</kbd> lưu
+                    </p>
+                    <div className="pager">
+                      <button
+                        type="button"
+                        disabled={safeStudyIndex === 0}
+                        onClick={goStudyPrev}
+                      >
+                        ← Câu trước
+                      </button>
+                      <span className="pager-counter">
+                        {safeStudyIndex + 1} / {filteredQuestions.length}
+                      </span>
+                      <button
+                        type="button"
+                        disabled={safeStudyIndex >= filteredQuestions.length - 1}
+                        onClick={goStudyNext}
+                      >
+                        Câu tiếp →
+                      </button>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="empty-card">
+                  <h2>Không có câu hỏi phù hợp</h2>
+                  <p>Hãy thử đổi bộ lọc trạng thái, chọn chương khác hoặc xóa từ khóa tìm kiếm.</p>
                   <button
                     type="button"
-                    className="search-clear"
+                    className="primary-btn"
                     onClick={() => {
+                      setChapter("Tất cả");
+                      setStudyFilter("all");
                       setQuery("");
                       setStudyIndex(0);
                     }}
-                    aria-label="Xóa từ khóa"
                   >
-                    ✕
+                    Hiển thị lại tất cả 600 câu
                   </button>
-                ) : null}
-              </div>
-            </div>
-
-            <div className="grid-header">
-              <span>Danh sách câu hỏi</span>
-              <span>{filteredQuestions.length} câu</span>
-            </div>
-
-            <div className="question-grid" aria-label="Danh sách câu hỏi">
-              {filteredQuestions.map((question, index) => {
-                const answered = progress.studyAnswers[question.id];
-                const isCorrect = answered !== undefined && answered === question.answer;
-                const isWrong = answered !== undefined && answered !== question.answer;
-                const isBookmarked = bookmarkSet.has(question.id);
-
-                return (
-                  <button
-                    key={question.id}
-                    type="button"
-                    className={[
-                      index === safeStudyIndex ? "current" : "",
-                      isCorrect ? "tile-correct" : "",
-                      isWrong ? "tile-wrong" : "",
-                      isBookmarked ? "tile-bookmarked" : "",
-                    ]
-                      .filter(Boolean)
-                      .join(" ")}
-                    onClick={() => setStudyIndex(index)}
-                  >
-                    {question.id}
-                  </button>
-                );
-              })}
-            </div>
-          </aside>
-
-          <section className="main-column">
-            {currentStudyQuestion ? (
-              <>
-                <QuestionCard
-                  question={currentStudyQuestion}
-                  selected={progress.studyAnswers[currentStudyQuestion.id]}
-                  reveal={
-                    progress.studyAnswers[currentStudyQuestion.id] !== undefined ||
-                    Boolean(peekedIds[currentStudyQuestion.id])
-                  }
-                  isBookmarked={bookmarkSet.has(currentStudyQuestion.id)}
-                  canPeekAnswer={progress.studyAnswers[currentStudyQuestion.id] === undefined}
-                  onPeekAnswer={() =>
-                    setPeekedIds((prev) => ({
-                      ...prev,
-                      [currentStudyQuestion.id]: true,
-                    }))
-                  }
-                  onToggleBookmark={() => toggleBookmark(currentStudyQuestion.id)}
-                  onSelect={(optionId) =>
-                    recordStudyAnswer(
-                      currentStudyQuestion.id,
-                      optionId,
-                      optionId === currentStudyQuestion.answer,
-                    )
-                  }
-                />
-
-                <div className="pager-bar">
-                  <p className="shortcut-hint">
-                    Phím tắt: <kbd>←</kbd> <kbd>→</kbd> chuyển câu · <kbd>1</kbd>–<kbd>4</kbd> chọn
-                    đáp án · <kbd>B</kbd> đánh dấu
-                  </p>
-                  <div className="pager">
-                    <button
-                      type="button"
-                      disabled={safeStudyIndex === 0}
-                      onClick={() => setStudyIndex((v) => Math.max(0, v - 1))}
-                    >
-                      ← Câu trước
-                    </button>
-                    <span className="pager-counter">
-                      {safeStudyIndex + 1} / {filteredQuestions.length}
-                    </span>
-                    <button
-                      type="button"
-                      disabled={safeStudyIndex >= filteredQuestions.length - 1}
-                      onClick={() =>
-                        setStudyIndex((v) => Math.min(filteredQuestions.length - 1, v + 1))
-                      }
-                    >
-                      Câu tiếp →
-                    </button>
-                  </div>
                 </div>
-              </>
-            ) : (
-              <div className="empty-card">
-                <h2>Không có câu hỏi phù hợp</h2>
-                <p>Hãy thử đổi bộ lọc trạng thái, chọn chương khác hoặc xóa từ khóa tìm kiếm.</p>
-                <button
-                  type="button"
-                  className="primary-btn"
-                  onClick={() => {
-                    setChapter("Tất cả");
-                    setStudyFilter("all");
-                    setQuery("");
-                    setStudyIndex(0);
-                  }}
-                >
-                  Hiển thị lại tất cả 600 câu
-                </button>
-              </div>
-            )}
-          </section>
-        </main>
+              )}
+            </section>
+          </main>
+
+          {/* Thanh điều hướng cố định dưới đáy cho điện thoại */}
+          <div className="mobile-bottom-bar">
+            <button
+              type="button"
+              className="mbar-nav"
+              disabled={safeStudyIndex === 0 || filteredQuestions.length === 0}
+              onClick={goStudyPrev}
+              aria-label="Câu trước"
+            >
+              ← Trước
+            </button>
+            <button
+              type="button"
+              className="mbar-center"
+              onClick={() => setMobileSheetOpen(true)}
+            >
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                aria-hidden="true"
+              >
+                <rect x="3" y="3" width="7" height="7" rx="1" />
+                <rect x="14" y="3" width="7" height="7" rx="1" />
+                <rect x="3" y="14" width="7" height="7" rx="1" />
+                <rect x="14" y="14" width="7" height="7" rx="1" />
+              </svg>
+              <span>
+                {filteredQuestions.length > 0
+                  ? `${safeStudyIndex + 1} / ${filteredQuestions.length}`
+                  : "0 / 0"}
+              </span>
+            </button>
+            <button
+              type="button"
+              className="mbar-nav primary"
+              disabled={
+                filteredQuestions.length === 0 || safeStudyIndex >= filteredQuestions.length - 1
+              }
+              onClick={goStudyNext}
+              aria-label="Câu tiếp theo"
+            >
+              Tiếp →
+            </button>
+          </div>
+        </>
       ) : mode === "exam" ? (
         examStatus === "idle" ? (
           <main className="exam-lobby">
@@ -745,9 +1233,12 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                 <span className="pill pill-primary">Cấu trúc lý thuyết hạng B</span>
                 <h2>Thi thử 30 câu hỏi trong 20 phút</h2>
                 <p>
-                  Mỗi đề thi thử được phân bổ đúng 6 chương chuẩn. Trả lời đúng tối thiểu{" "}
-                  <strong>{PASS_SCORE}/{EXAM_SIZE} câu</strong> để đạt yêu cầu. Bạn có thể chọn đề
-                  ngẫu nhiên hoặc luyện lần lượt theo bộ {FIXED_EXAM_COUNT} đề chuẩn bên dưới.
+                  Đề thi được phân bổ đúng 6 chương chuẩn. Trả lời đúng tối thiểu{" "}
+                  <strong>
+                    {PASS_SCORE}/{EXAM_SIZE} câu
+                  </strong>{" "}
+                  để đạt yêu cầu. Bạn có thể tạo đề ngẫu nhiên hoặc luyện lần lượt theo bộ{" "}
+                  {FIXED_EXAM_COUNT} đề chuẩn bên dưới.
                 </p>
 
                 <div className="distribution-grid">
@@ -765,7 +1256,8 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                   Tạo đề ngẫu nhiên
                 </button>
                 <p className="hero-note">
-                  Tự động chấm điểm, phân tích theo chương và lưu các câu làm sai để bạn ôn lại.
+                  Chấm điểm ngay sau khi nộp, thống kê theo từng chương và tự động lưu câu làm sai
+                  để bạn ôn lại.
                 </p>
               </div>
             </section>
@@ -774,7 +1266,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
               <div className="section-head">
                 <div>
                   <h3>Bộ {FIXED_EXAM_COUNT} đề luyện tập chuẩn</h3>
-                  <p>Phân bổ đều từ ngân hàng 600 câu hỏi giúp bạn ôn tập có hệ thống.</p>
+                  <p>Phân bổ đều từ ngân hàng 600 câu hỏi giúp bạn ôn luyện có hệ thống.</p>
                 </div>
                 <span className="pill pill-muted">
                   Đã vượt qua: {Array.from(bestByExamSet.values()).filter((x) => x.passed).length}/
@@ -798,7 +1290,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                       <span className="set-title">Đề số {setNum}</span>
                       <span className="set-meta">
                         {best
-                          ? `${best.passed ? "Đạt" : "Chưa đạt"} · ${best.correct}/${best.total}`
+                          ? `${best.passed ? "✓ Đạt" : "Chưa đạt"} · ${best.correct}/${best.total}`
                           : `${EXAM_SIZE} câu · 20 phút`}
                       </span>
                     </button>
@@ -812,10 +1304,10 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                 <div className="section-head">
                   <div>
                     <h3>Lần thi thử gần đây</h3>
-                    <p>Hiển thị 5 lượt làm bài mới nhất được lưu trên trình duyệt của bạn.</p>
+                    <p>5 lượt làm bài mới nhất được lưu trên trình duyệt của bạn.</p>
                   </div>
-                  <button type="button" className="ghost-btn" onClick={() => setMode("stats")}>
-                    Xem toàn bộ lịch sử
+                  <button type="button" className="ghost-btn small" onClick={() => setMode("stats")}>
+                    Xem toàn bộ
                   </button>
                 </div>
 
@@ -827,7 +1319,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                         <span className="muted-text">{formatDateTime(item.completedAt)}</span>
                       </div>
                       <div className="history-badges">
-                        <span className="muted-text">Thời gian: {formatTime(item.durationSeconds)}</span>
+                        <span className="muted-text">{formatTime(item.durationSeconds)}</span>
                         <span className={`pill ${item.passed ? "pill-ok" : "pill-bad"}`}>
                           {item.passed ? "Đạt" : "Chưa đạt"} · {item.correct}/{item.total}
                         </span>
@@ -839,232 +1331,181 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
             ) : null}
           </main>
         ) : (
-          <main className="workspace">
-            <aside className="sidebar">
-              <div className="exam-header-box">
-                <span className="pill pill-primary">{examLabel}</span>
+          <>
+            {/* Thanh trạng thái bài thi ghim trên điện thoại */}
+            <div className="mobile-exam-bar">
+              <div className="mexam-left">
+                <span
+                  className={`mexam-timer ${examStatus === "active" ? timerState : "done"}`}
+                >
+                  {examStatus === "active"
+                    ? formatTime(timeLeft)
+                    : `${examResult?.correct ?? 0}/${examQuestions.length}`}
+                </span>
+                <span className="mexam-sub">
+                  {examStatus === "active"
+                    ? `${answeredExamCount}/${examQuestions.length} đã chọn`
+                    : examResult?.passed
+                      ? "Đạt yêu cầu"
+                      : "Chưa đạt"}
+                </span>
+              </div>
+
+              <div className="mexam-actions">
                 {examStatus === "active" ? (
-                  confirmExitExam ? (
-                    <div className="inline-confirm">
-                      <button
-                        type="button"
-                        className="danger-link"
-                        onClick={() => {
-                          setExamStatus("idle");
-                          setConfirmExitExam(false);
-                        }}
-                      >
-                        Xác nhận thoát
-                      </button>
-                      <button
-                        type="button"
-                        className="muted-link"
-                        onClick={() => setConfirmExitExam(false)}
-                      >
-                        Hủy
-                      </button>
-                    </div>
-                  ) : (
-                    <button
-                      type="button"
-                      className="muted-link"
-                      onClick={() => setConfirmExitExam(true)}
-                    >
-                      Thoát đề
-                    </button>
-                  )
+                  <button
+                    type="button"
+                    className="primary-btn small"
+                    onClick={handleRequestSubmit}
+                  >
+                    Nộp bài
+                  </button>
                 ) : (
                   <button
                     type="button"
-                    className="muted-link"
-                    onClick={() => setExamStatus("idle")}
+                    className="primary-btn small"
+                    onClick={() => setShowResultModal(true)}
                   >
-                    Chọn đề khác
+                    Kết quả
                   </button>
                 )}
               </div>
+            </div>
 
-              <div className={`timer-card ${examStatus === "active" ? timerState : "done"}`}>
-                <span>{examStatus === "active" ? "Thời gian còn lại" : "Thời gian hoàn thành"}</span>
-                <strong>
-                  {examStatus === "active"
-                    ? formatTime(timeLeft)
-                    : formatTime(examResult?.durationSeconds ?? 0)}
-                </strong>
-                <p>
-                  Đã chọn {answeredExamCount} / {examQuestions.length} câu
-                </p>
-              </div>
+            <main className="workspace">
+              <aside className="sidebar desktop-sidebar">{examSidebarContent}</aside>
 
-              {examStatus === "done" && examResult ? (
-                <div className={`result-summary-card ${examResult.passed ? "passed" : "failed"}`}>
-                  <div className="result-summary-head">
-                    <span>{examResult.passed ? "Đạt yêu cầu" : "Chưa đạt yêu cầu"}</span>
-                    <strong>
-                      {examResult.correct}/{examResult.total}
-                    </strong>
-                  </div>
-                  <p>
-                    Đúng {examResult.correct} · Sai {examResult.wrong} · Bỏ trống{" "}
-                    {examResult.unanswered} ({Math.round((examResult.correct / examResult.total) * 100)}%)
-                  </p>
-                  <div className="result-summary-actions">
-                    <button
-                      type="button"
-                      className="ghost-btn small"
-                      onClick={() => setShowResultModal(true)}
-                    >
-                      Chi tiết kết quả
-                    </button>
-                    <button type="button" className="primary-btn small" onClick={startRandomExam}>
-                      Đề ngẫu nhiên mới
-                    </button>
-                  </div>
-                </div>
-              ) : null}
+              <section className="main-column">
+                {currentExamEntry ? (
+                  <>
+                    <QuestionCard
+                      question={currentExamEntry.question}
+                      badgeText={`Câu ${currentExamEntry.originalIndex + 1}/${examQuestions.length} · Mã ${currentExamEntry.question.id}`}
+                      selected={examAnswers[currentExamEntry.question.id]}
+                      reveal={examStatus === "done"}
+                      readOnly={examStatus === "done"}
+                      isBookmarked={bookmarkSet.has(currentExamEntry.question.id)}
+                      onToggleBookmark={() => toggleBookmark(currentExamEntry.question.id)}
+                      onSelect={(optionId) => {
+                        if (examStatus !== "active") return;
+                        const qId = currentExamEntry.question.id;
+                        setExamAnswers((prev) => ({ ...prev, [qId]: optionId }));
+                      }}
+                      onSwipePrev={goExamPrev}
+                      onSwipeNext={goExamNext}
+                    />
 
-              {examStatus === "done" ? (
-                <div className="filter-chips" role="group" aria-label="Lọc câu xem lại">
-                  <button
-                    type="button"
-                    className={`chip-btn${reviewFilter === "all" ? " active" : ""}`}
-                    onClick={() => {
-                      setReviewFilter("all");
-                      setExamIndex(0);
-                    }}
-                  >
-                    Tất cả ({examQuestions.length})
-                  </button>
-                  <button
-                    type="button"
-                    className={`chip-btn${reviewFilter === "mistakes" ? " active" : ""}`}
-                    onClick={() => {
-                      setReviewFilter("mistakes");
-                      setExamIndex(0);
-                    }}
-                  >
-                    Câu sai & bỏ trống (
-                    {(examResult?.wrong ?? 0) + (examResult?.unanswered ?? 0)})
-                  </button>
-                </div>
-              ) : null}
-
-              <div className="question-grid exam-grid" aria-label="Danh sách câu trong đề">
-                {visibleExamEntries.map(({ question, originalIndex }, idx) => {
-                  const selected = examAnswers[question.id];
-                  const isCorrect = examStatus === "done" && selected === question.answer;
-                  const isWrong = examStatus === "done" && selected !== question.answer;
-
-                  return (
-                    <button
-                      key={question.id}
-                      type="button"
-                      className={[
-                        idx === safeExamEntryIndex ? "current" : "",
-                        examStatus === "active" && selected !== undefined ? "tile-answered" : "",
-                        isCorrect ? "tile-correct" : "",
-                        isWrong ? "tile-wrong" : "",
-                        bookmarkSet.has(question.id) ? "tile-bookmarked" : "",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      onClick={() => setExamIndex(idx)}
-                    >
-                      {originalIndex + 1}
-                    </button>
-                  );
-                })}
-              </div>
-
-              {examStatus === "active" ? (
-                <button
-                  type="button"
-                  className="primary-btn full-width"
-                  onClick={handleRequestSubmit}
-                >
-                  Nộp bài ({answeredExamCount}/{examQuestions.length})
-                </button>
-              ) : null}
-            </aside>
-
-            <section className="main-column">
-              {currentExamEntry ? (
-                <>
-                  <QuestionCard
-                    question={currentExamEntry.question}
-                    badgeText={`Câu ${currentExamEntry.originalIndex + 1}/${examQuestions.length} · Mã ${currentExamEntry.question.id}`}
-                    selected={examAnswers[currentExamEntry.question.id]}
-                    reveal={examStatus === "done"}
-                    readOnly={examStatus === "done"}
-                    isBookmarked={bookmarkSet.has(currentExamEntry.question.id)}
-                    onToggleBookmark={() => toggleBookmark(currentExamEntry.question.id)}
-                    onSelect={(optionId) => {
-                      if (examStatus !== "active") return;
-                      const qId = currentExamEntry.question.id;
-                      setExamAnswers((prev) => ({ ...prev, [qId]: optionId }));
-                    }}
-                  />
-
-                  <div className="pager-bar">
-                    <p className="shortcut-hint">
-                      Phím tắt: <kbd>←</kbd> <kbd>→</kbd> chuyển câu
-                      {examStatus === "active" ? (
-                        <>
-                          {" "}
-                          · <kbd>1</kbd>–<kbd>4</kbd> chọn đáp án
-                        </>
-                      ) : null}{" "}
-                      · <kbd>B</kbd> đánh dấu
-                    </p>
-                    <div className="pager">
-                      <button
-                        type="button"
-                        disabled={safeExamEntryIndex === 0}
-                        onClick={() => setExamIndex((v) => Math.max(0, v - 1))}
-                      >
-                        ← Câu trước
-                      </button>
-                      <span className="pager-counter">
-                        {safeExamEntryIndex + 1} / {visibleExamEntries.length}
-                      </span>
-                      <button
-                        type="button"
-                        disabled={safeExamEntryIndex >= visibleExamEntries.length - 1}
-                        onClick={() =>
-                          setExamIndex((v) => Math.min(visibleExamEntries.length - 1, v + 1))
-                        }
-                      >
-                        Câu tiếp →
-                      </button>
-                      {examStatus === "active" ? (
+                    <div className="pager-bar desktop-pager">
+                      <p className="shortcut-hint">
+                        Phím tắt: <kbd>←</kbd> <kbd>→</kbd> chuyển câu
+                        {examStatus === "active" ? (
+                          <>
+                            {" "}
+                            · <kbd>1</kbd>–<kbd>4</kbd> chọn đáp án
+                          </>
+                        ) : null}{" "}
+                        · <kbd>B</kbd> lưu
+                      </p>
+                      <div className="pager">
                         <button
                           type="button"
-                          className="primary-btn"
-                          onClick={handleRequestSubmit}
+                          disabled={safeExamEntryIndex === 0}
+                          onClick={goExamPrev}
                         >
-                          Nộp bài
+                          ← Câu trước
                         </button>
-                      ) : null}
+                        <span className="pager-counter">
+                          {safeExamEntryIndex + 1} / {visibleExamEntries.length}
+                        </span>
+                        <button
+                          type="button"
+                          disabled={safeExamEntryIndex >= visibleExamEntries.length - 1}
+                          onClick={goExamNext}
+                        >
+                          Câu tiếp →
+                        </button>
+                        {examStatus === "active" ? (
+                          <button
+                            type="button"
+                            className="primary-btn"
+                            onClick={handleRequestSubmit}
+                          >
+                            Nộp bài
+                          </button>
+                        ) : null}
+                      </div>
                     </div>
+                  </>
+                ) : (
+                  <div className="empty-card">
+                    <h2>Tuyệt vời! Bạn không làm sai câu nào</h2>
+                    <p>Toàn bộ 30 câu trong đề này đều đã được trả lời chính xác.</p>
+                    <button
+                      type="button"
+                      className="primary-btn"
+                      onClick={() => {
+                        setReviewFilter("all");
+                        setExamIndex(0);
+                      }}
+                    >
+                      Xem lại toàn bộ 30 câu
+                    </button>
                   </div>
-                </>
-              ) : (
-                <div className="empty-card">
-                  <h2>Tuyệt vời! Bạn không làm sai câu nào</h2>
-                  <p>Toàn bộ 30 câu trong đề này đều đã được trả lời chính xác.</p>
-                  <button
-                    type="button"
-                    className="primary-btn"
-                    onClick={() => {
-                      setReviewFilter("all");
-                      setExamIndex(0);
-                    }}
-                  >
-                    Xem lại toàn bộ 30 câu
-                  </button>
-                </div>
-              )}
-            </section>
+                )}
+              </section>
+            </main>
+
+            {/* Thanh điều hướng dưới đáy cho Thi thử trên điện thoại */}
+            <div className="mobile-bottom-bar">
+              <button
+                type="button"
+                className="mbar-nav"
+                disabled={safeExamEntryIndex === 0 || visibleExamEntries.length === 0}
+                onClick={goExamPrev}
+                aria-label="Câu trước"
+              >
+                ← Trước
+              </button>
+              <button
+                type="button"
+                className="mbar-center"
+                onClick={() => setMobileSheetOpen(true)}
+              >
+                <svg
+                  width="16"
+                  height="16"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="3" y="3" width="7" height="7" rx="1" />
+                  <rect x="14" y="3" width="7" height="7" rx="1" />
+                  <rect x="3" y="14" width="7" height="7" rx="1" />
+                  <rect x="14" y="14" width="7" height="7" rx="1" />
+                </svg>
+                <span>
+                  {visibleExamEntries.length > 0
+                    ? `Câu ${safeExamEntryIndex + 1}/${visibleExamEntries.length}`
+                    : "Danh sách"}
+                </span>
+              </button>
+              <button
+                type="button"
+                className="mbar-nav primary"
+                disabled={
+                  visibleExamEntries.length === 0 ||
+                  safeExamEntryIndex >= visibleExamEntries.length - 1
+                }
+                onClick={goExamNext}
+                aria-label="Câu tiếp theo"
+              >
+                Tiếp →
+              </button>
+            </div>
 
             {confirmSubmitOpen ? (
               <div
@@ -1077,7 +1518,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                 <div className="modal-card" onClick={(event) => event.stopPropagation()}>
                   <h2>Xác nhận nộp bài?</h2>
                   <p>
-                    Bạn mới trả lời{" "}
+                    Bạn đã trả lời{" "}
                     <strong>
                       {answeredExamCount}/{examQuestions.length}
                     </strong>{" "}
@@ -1130,7 +1571,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                   </p>
                   <p className="result-note">
                     {examResult.passed
-                      ? `Bạn đã vượt qua ngưỡng đạt tối thiểu ${PASS_SCORE}/${EXAM_SIZE} câu. Hãy tiếp tục ôn luyện để giữ vững phong độ.`
+                      ? `Bạn đã vượt qua ngưỡng đạt tối thiểu ${PASS_SCORE}/${EXAM_SIZE} câu. Hãy tiếp tục ôn luyện để giữ vững kết quả.`
                       : `Cần đúng tối thiểu ${PASS_SCORE}/${EXAM_SIZE} câu để đạt. Các câu làm sai đã được lưu vào mục "Làm sai" để bạn dễ dàng ôn lại.`}
                   </p>
 
@@ -1179,7 +1620,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                       className="ghost-btn"
                       onClick={() => setShowResultModal(false)}
                     >
-                      Xem lại toàn bộ
+                      Xem lại bài
                     </button>
                     <button type="button" className="primary-btn" onClick={startRandomExam}>
                       Làm đề mới
@@ -1188,7 +1629,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
                 </div>
               </div>
             ) : null}
-          </main>
+          </>
         )
       ) : (
         <main className="stats-page">
@@ -1204,20 +1645,22 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
               <span>Độ chính xác</span>
               <strong>{studySummary.accuracy}%</strong>
               <p>
-                Đúng {studySummary.correct} · Sai {studySummary.wrong} trong phần ôn tập
+                Đúng {studySummary.correct} · Sai {studySummary.wrong} khi ôn tập
               </p>
             </div>
             <div className="kpi-card">
               <span>Câu cần ôn lại</span>
               <strong>{progress.wrongIds.length}</strong>
-              <p>Gồm các câu trả lời sai khi ôn tập hoặc thi thử</p>
+              <p>Gồm các câu trả lời sai ở Ôn tập & Thi thử</p>
             </div>
             <div className="kpi-card">
               <span>Thi thử đạt yêu cầu</span>
               <strong>
                 {passedExamsCount}/{progress.examHistory.length}
               </strong>
-              <p>Số lượt đạt tối thiểu {PASS_SCORE}/{EXAM_SIZE} câu</p>
+              <p>
+                Đạt từ {PASS_SCORE}/{EXAM_SIZE} câu trở lên
+              </p>
             </div>
           </section>
 
@@ -1236,7 +1679,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
               disabled={progress.bookmarks.length === 0}
               onClick={() => jumpToStudy("Tất cả", "bookmarked")}
             >
-              Xem {progress.bookmarks.length} câu đã đánh dấu
+              Xem {progress.bookmarks.length} câu đã lưu
             </button>
             <button type="button" className="ghost-btn" onClick={startRandomExam}>
               Làm đề thi thử mới
@@ -1247,7 +1690,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
             <div className="section-head">
               <div>
                 <h3>Tiến độ theo từng chương</h3>
-                <p>Theo dõi mức độ hoàn thành và chọn nhanh chương cần ôn thêm.</p>
+                <p>Theo dõi mức độ hoàn thành và mở nhanh chương cần ôn thêm.</p>
               </div>
             </div>
 
@@ -1322,7 +1765,8 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
               <div>
                 <h3>Quản lý dữ liệu lưu trên trình duyệt</h3>
                 <p>
-                  Tiến độ ôn tập, câu đánh dấu và lịch sử thi thử được lưu cục bộ trên máy của bạn.
+                  Tiến độ ôn tập, câu đã lưu và lịch sử thi thử được lưu cục bộ ngay trên thiết bị
+                  của bạn.
                 </p>
               </div>
             </div>
@@ -1330,7 +1774,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
             <div className="danger-actions">
               {confirmReset === "study" ? (
                 <div className="confirm-bar">
-                  <span>Xóa toàn bộ đáp án đã chọn ở phần Ôn tập và danh sách câu làm sai?</span>
+                  <span>Xóa đáp án đã chọn ở Ôn tập và danh sách câu làm sai?</span>
                   <button
                     type="button"
                     className="danger-btn"
@@ -1362,9 +1806,7 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
 
               {confirmReset === "all" ? (
                 <div className="confirm-bar">
-                  <span>
-                    Xóa toàn bộ tiến độ ôn tập, câu đã đánh dấu và toàn bộ lịch sử thi thử?
-                  </span>
+                  <span>Xóa toàn bộ tiến độ ôn tập, câu đã lưu và toàn bộ lịch sử thi thử?</span>
                   <button
                     type="button"
                     className="danger-btn"
@@ -1397,6 +1839,35 @@ export default function QuizApp({ questions }: { questions: Question[] }) {
           </section>
         </main>
       )}
+
+      {/* Ngăn kéo trượt lên cho điện thoại / máy tính bảng */}
+      {mobileSheetOpen && hasMobileBottomBar ? (
+        <div
+          className="sheet-overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label={mode === "study" ? "Bộ lọc và danh sách câu hỏi" : "Danh sách câu trong đề"}
+          onClick={() => setMobileSheetOpen(false)}
+        >
+          <div className="sheet-panel" onClick={(event) => event.stopPropagation()}>
+            <div className="sheet-handle" aria-hidden="true" />
+            <div className="sheet-header">
+              <h2>{mode === "study" ? "Bộ lọc & chọn câu hỏi" : "Danh sách câu trong đề"}</h2>
+              <button
+                type="button"
+                className="sheet-close"
+                onClick={() => setMobileSheetOpen(false)}
+                aria-label="Đóng bảng chọn câu"
+              >
+                Đóng
+              </button>
+            </div>
+            <div className="sheet-body">
+              {mode === "study" ? studySidebarContent : examSidebarContent}
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

@@ -4,7 +4,10 @@ import { useSyncExternalStore } from "react";
 import type { ExamHistoryItem, LearningProgress } from "../types";
 
 const STORAGE_KEY = "hoclaixe_progress_v1";
+const THEME_KEY = "hoclaixe_theme_v1";
 const MAX_HISTORY_ITEMS = 30;
+
+export type ThemeMode = "light" | "dark";
 
 const EMPTY_PROGRESS: LearningProgress = {
   version: 1,
@@ -18,8 +21,17 @@ let cachedRaw: string | null | undefined = undefined;
 let cachedProgress: LearningProgress = EMPTY_PROGRESS;
 const listeners = new Set<() => void>();
 
+let cachedTheme: ThemeMode | undefined = undefined;
+const themeListeners = new Set<() => void>();
+
 function notifyListeners() {
   for (const listener of listeners) {
+    listener();
+  }
+}
+
+function notifyThemeListeners() {
+  for (const listener of themeListeners) {
     listener();
   }
 }
@@ -135,6 +147,84 @@ function writeProgress(next: LearningProgress) {
 
 export function useLearningProgress(): LearningProgress {
   return useSyncExternalStore(subscribe, getClientSnapshot, getServerSnapshot);
+}
+
+// Theme store
+function getThemeSnapshot(): ThemeMode {
+  if (typeof window === "undefined") return "light";
+  if (cachedTheme) return cachedTheme;
+  try {
+    const domTheme = document.documentElement.dataset.theme;
+    if (domTheme === "dark" || domTheme === "light") {
+      cachedTheme = domTheme;
+      return cachedTheme;
+    }
+    const stored = window.localStorage.getItem(THEME_KEY);
+    if (stored === "dark" || stored === "light") {
+      cachedTheme = stored;
+      return cachedTheme;
+    }
+    if (window.matchMedia?.("(prefers-color-scheme: dark)").matches) {
+      cachedTheme = "dark";
+      return cachedTheme;
+    }
+  } catch {
+    // fallback
+  }
+  cachedTheme = "light";
+  return cachedTheme;
+}
+
+function getThemeServerSnapshot(): ThemeMode {
+  return "light";
+}
+
+function subscribeTheme(listener: () => void): () => void {
+  themeListeners.add(listener);
+  if (typeof window === "undefined") {
+    return () => {
+      themeListeners.delete(listener);
+    };
+  }
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key === THEME_KEY) {
+      cachedTheme = undefined;
+      const next = getThemeSnapshot();
+      document.documentElement.dataset.theme = next;
+      notifyThemeListeners();
+    }
+  };
+  window.addEventListener("storage", handleStorage);
+  return () => {
+    themeListeners.delete(listener);
+    window.removeEventListener("storage", handleStorage);
+  };
+}
+
+export function useTheme(): ThemeMode {
+  return useSyncExternalStore(
+    subscribeTheme,
+    getThemeSnapshot,
+    getThemeServerSnapshot,
+  );
+}
+
+export function setThemeMode(next: ThemeMode) {
+  cachedTheme = next;
+  if (typeof window !== "undefined") {
+    document.documentElement.dataset.theme = next;
+    try {
+      window.localStorage.setItem(THEME_KEY, next);
+    } catch {
+      // ignore
+    }
+  }
+  notifyThemeListeners();
+}
+
+export function toggleThemeMode() {
+  const current = getThemeSnapshot();
+  setThemeMode(current === "dark" ? "light" : "dark");
 }
 
 export function recordStudyAnswer(
